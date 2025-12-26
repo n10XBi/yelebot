@@ -1,0 +1,13 @@
+name = "yelebot"
+main = "index.js"
+compatibility_date = "2024-12-01"
+workers_dev = true
+
+# =========================
+# ENV VARIABLES
+# =========================
+[vars]
+BOT_TOKEN = "8501236337:AAGZH8zpqfm_cy-5TV81OkLfMeSNcQN5D9o"
+# JANGAN hardcode token di sini kalau repo public
+# Lebih aman set via dashboard
+# BOT_TOKEN = "123456:ABCDEF"
