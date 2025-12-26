@@ -1,14 +1,9 @@
-// worker.js — Telegram worker (full)
-// Features:
-// - Menu image + inline buttons
-// - answerCallbackQuery for every callback (fix tombol)
-// - Konfirmasi sebelum invoice
-// - Invoice ID otomatis (INV...)
-// - ORDERS map: /status <id>, /cancel <id>
-// - Jam kerja strict (WIB)
+// worker.js — Telegram Worker (full, stateless callbacks, admin approve/reject, cancel by ID)
+// Env required: BOT_TOKEN, ADMIN_CHAT_ID (chat id where admin will get notifications)
+// Optional: ADMIN_USER_ID (telegram numeric id for admin user, used for permission checking)
 
-const USER_STATE = new Map(); // per-user interaction state
-const ORDERS = new Map(); // invoiceId -> order object
+const USER_STATE = new Map(); // temporary per-user flow (safe to use for in-flow, but not for final confirm)
+const ORDERS = new Map(); // invoiceId -> order object (in-memory)
 
 // CONFIG
 const MENU_IMAGE = "https://lh3.googleusercontent.com/86arOE_jc_FYR6_mPbeXrzWB4LwvgCRWPGXbbftgG4_zAjY05ajbmq3xiG0Xc_uYCoTccikGvLdo5WIlofH5pmySn1VRejqngh2pwDLquiLJYayCOJKUrZKFnOwmSxKzQqqOM1y5o42TPk6LYR1vbPjrEPx3dQIUEwS4IPRjzt3JdPZT32TkqCECm-PoQtsBAPnyN6g46PbiyD9fblgzuBcT2xuO1AaZgOkR53bom8ATCBkDgcYT_mnsxWuxLGp6cNFUR4lWBFKyYkYJWJY--KmIVCWDDoJ3SxwjimGjwRG-X2Qu3AP4wa6tRazHuBo3a8IOofm6f5arSRdpVy4AaXoacTPz8TSkcofA0YaIttHpek1Gi5v1yMSbi5mHV6Mfv4lyczXPp8c5iNR7IFPvgMz1BiCETTxNwSvDjb2JCN94_256Fzejrs-Dk-kMYeCCYQh2Zd_lt9xiEQDgZ5gufdpxxM9xDiP447vrOqKbBMcAS_6hu43EwRi97ILAhBpS3QLP-4WhKf4GHauWqML_EcBvhszB-6T1iGeCWvpAT9jZVDVgekalBvLZiZNoy5Ow9QlnHA=w1827-h711-no";
@@ -19,7 +14,7 @@ const PRODUCTS = {
     name: "Roti Premium",
     desc: "Roti premium tanpa kulit dengan topping coklat & keju",
     price: 12000,
-    image: MENU_IMAGE // reuse or put specific image
+    image: MENU_IMAGE
   }
 };
 
@@ -28,7 +23,7 @@ const WORK_START = 8; // 08:00
 const WORK_END = 17;  // 17:00
 const TZ_OFFSET = 7;  // WIB = UTC+7
 
-// Helper: get current date in WIB
+// UTIL
 function getWIBDate() {
   const now = new Date();
   const utc = now.getTime() + now.getTimezoneOffset() * 60000;
@@ -39,24 +34,59 @@ function isWorkingHour() {
   const h = d.getHours();
   return h >= WORK_START && h < WORK_END;
 }
-
 function formatRupiah(num) {
   return "Rp" + Number(num).toLocaleString("id-ID");
 }
-
 function generateInvoiceId() {
   return "INV" + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2,6).toUpperCase();
 }
 
+// Telegram helper
 async function tg(env, method, data) {
-  return await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data)
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data)
+    });
+    return res;
+  } catch (e) {
+    // swallow; caller can ignore or handle
+    return null;
+  }
+}
+
+// send admin notification (with approve/reject)
+async function notifyAdmin(env, order) {
+  const adminChat = env.ADMIN_CHAT_ID;
+  if (!adminChat) return;
+  const text =
+    `🔔 *New Order* (ID: ${order.id})\n\n` +
+    `User: ${order.userId}\n` +
+    `Produk: *${order.name}*\n` +
+    `Jumlah: ${order.qty}\n` +
+    `Total: *${formatRupiah(order.total)}*\n` +
+    `Dibuat: ${order.createdAt}\n\n` +
+    `Tekan Approve untuk setujui, Reject untuk tolak.`;
+  await tg(env, "sendMessage", {
+    chat_id: adminChat,
+    text,
+    parse_mode: "Markdown",
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "✅ Approve", callback_data: `admin_approve|${order.id}` },
+          { text: "❌ Reject", callback_data: `admin_reject|${order.id}` }
+        ],
+        [
+          { text: "🗑 Cancel Order", callback_data: `admin_cancel|${order.id}` }
+        ]
+      ]
+    }
   });
 }
 
-// Main worker
+// MAIN
 export default {
   async fetch(req, env) {
     if (req.method !== "POST") return new Response("OK");
@@ -64,103 +94,112 @@ export default {
     try {
       update = await req.json();
     } catch (e) {
-      return new Response("Bad request", { status: 400 });
+      return new Response("Bad Request", { status: 400 });
     }
 
-    // CALLBACK handler (inline buttons)
+    // CALLBACK handler
     if (update.callback_query) {
       const cb = update.callback_query;
       const chatId = cb.message.chat.id;
-      const userId = cb.from.id;
-      const data = cb.data;
+      const fromId = cb.from.id;
+      const data = cb.data || "";
 
-      // MUST answer callback to avoid "dead" buttons
-      await tg(env, "answerCallbackQuery", { callback_query_id: cb.id }).catch(() => {});
+      // Always answer to avoid "dead" buttons
+      await tg(env, "answerCallbackQuery", { callback_query_id: cb.id }).catch(()=>{});
 
-      // Handle menu selection
-      if (data === "menu_premium") {
-        USER_STATE.set(userId, { step: "interest", product: "premium" });
-
-        const p = PRODUCTS.premium;
+      // MENU selection (user)
+      if (data.startsWith("menu_")) {
+        const key = data.replace("menu_", "");
+        const p = PRODUCTS[key];
+        if (!p) {
+          await tg(env, "sendMessage", { chat_id: chatId, text: "Produk tidak ditemukan." });
+          return new Response("OK");
+        }
+        USER_STATE.set(fromId, { step: "interest", product: key });
         await tg(env, "sendPhoto", {
-          chat_id: chatId,
+          chat_id,
           photo: p.image,
           caption: `🥖 *${p.name}*\n\n${p.desc}\n\n💰 *${formatRupiah(p.price)}*\n\nApakah Anda ingin memesan?`,
           parse_mode: "Markdown",
           reply_markup: {
             inline_keyboard: [
-              [{ text: "✅ Ya", callback_data: "yes_interest" }],
-              [{ text: "❌ Tidak", callback_data: "no_interest" }]
+              [{ text: "✅ Ya", callback_data: `yes_interest|${key}` }],
+              [{ text: "❌ Tidak", callback_data: `no_interest` }]
             ]
           }
         });
+        return new Response("OK");
       }
 
-      // User confirmed interest and wants to enter qty
-      else if (data === "yes_interest") {
-        USER_STATE.set(userId, { step: "qty", product: "premium" });
-        await tg(env, "sendMessage", { chat_id: chatId, text: "Mau pesan berapa buah?" });
+      // yes_interest -> ask qty
+      if (data.startsWith("yes_interest")) {
+        const parts = data.split("|");
+        const key = parts[1]; // product
+        USER_STATE.set(fromId, { step: "qty", product: key });
+        await tg(env, "sendMessage", { chat_id, text: "Mau pesan berapa buah?" });
+        return new Response("OK");
       }
 
-      // User declined
-      else if (data === "no_interest") {
-        USER_STATE.delete(userId);
-        await tg(env, "sendMessage", { chat_id: chatId, text: "Siap kak 🙏 Kalau butuh silakan chat lagi." });
+      // no_interest -> cancel
+      if (data === "no_interest") {
+        USER_STATE.delete(fromId);
+        await tg(env, "sendMessage", { chat_id, text: "Siap kak 🙏 Kalau butuh silakan chat lagi." });
+        return new Response("OK");
       }
 
-      // After user enters qty we will ask confirmation with buttons:
-      else if (data === "confirm_order") {
-        const state = USER_STATE.get(userId);
-        if (!state || !state.product || !state.qty) {
-          await tg(env, "sendMessage", { chat_id: chatId, text: "Maaf, data pesanan tidak ditemukan. Silakan mulai lagi." });
-          USER_STATE.delete(userId);
+      // confirm_order encoded: confirm_order|product|qty|userId
+      if (data.startsWith("confirm_order|")) {
+        // parse tokens
+        const tokens = data.split("|");
+        // expected [confirm_order, productKey, qty, userId]
+        const productKey = tokens[1];
+        const qty = Number(tokens[2]);
+        const origUserId = Number(tokens[3]);
+
+        const p = PRODUCTS[productKey];
+        if (!p || !qty || !origUserId) {
+          await tg(env, "sendMessage", { chat_id, text: "Maaf, data pesanan tidak valid. Silakan mulai ulang." });
           return new Response("OK");
         }
 
-        // create invoice id and store order
-        const p = PRODUCTS[state.product];
-        const total = p.price * state.qty;
+        // create order
         const invId = generateInvoiceId();
         const now = getWIBDate().toISOString();
-
+        const total = p.price * qty;
         const order = {
           id: invId,
-          userId,
-          chatId,
+          userId: origUserId,
+          chatId: chatId, // chat where confirmed (user chat)
           product: p.key,
           name: p.name,
           desc: p.desc,
           price: p.price,
-          qty: state.qty,
+          qty,
           total,
           status: "pending",
           createdAt: now
         };
         ORDERS.set(invId, order);
-        USER_STATE.delete(userId);
 
-        // Message about invoice + if outside working hours, tell when admin will confirm
+        // notify user invoice created
         if (isWorkingHour()) {
           await tg(env, "sendMessage", {
-            chat_id: chatId,
+            chat_id,
             text:
               `🧾 *Invoice Sementara* (ID: *${invId}*)\n\n` +
               `Produk: *${order.name}*\nJumlah: ${order.qty}\nHarga satuan: ${formatRupiah(order.price)}\n\n*Total: ${formatRupiah(order.total)}*\n\n` +
-              `⏳ Pesanan Anda akan segera dikonfirmasi oleh admin (dalam jam kerja).`,
+              `⏳ Pesanan Anda akan segera dikonfirmasi oleh admin.`,
             parse_mode: "Markdown"
           });
         } else {
-          // compute next work start time (next day's WORK_START if now past end)
-          const now = getWIBDate();
-          let confirmAt = new Date(now);
-          if (now.getHours() >= WORK_END) {
-            // next day at WORK_START
-            confirmAt.setDate(confirmAt.getDate() + 1);
-          }
+          // compute next work start
+          const nowDate = getWIBDate();
+          let confirmAt = new Date(nowDate);
+          if (nowDate.getHours() >= WORK_END) confirmAt.setDate(confirmAt.getDate() + 1);
           confirmAt.setHours(WORK_START, 0, 0, 0);
           const confirmAtStr = confirmAt.toLocaleString("id-ID");
           await tg(env, "sendMessage", {
-            chat_id: chatId,
+            chat_id,
             text:
               `🧾 *Invoice Sementara* (ID: *${invId}*)\n\n` +
               `Produk: *${order.name}*\nJumlah: ${order.qty}\nHarga satuan: ${formatRupiah(order.price)}\n\n*Total: ${formatRupiah(order.total)}*\n\n` +
@@ -169,28 +208,84 @@ export default {
           });
         }
 
-        // (Optional) notify admin/chat channel here by calling env.ADMIN_CHAT_ID if set
-        // if (env.ADMIN_CHAT_ID) { await tg(env, "sendMessage", { chat_id: env.ADMIN_CHAT_ID, text: `New order ${invId}` }); }
+        // notify admin (with approve/reject)
+        await notifyAdmin(env, order).catch(()=>{});
+
+        // clear any user state (we already stored order)
+        USER_STATE.delete(origUserId);
 
         return new Response("OK");
       }
 
-      // Cancel order from the confirmation buttons
-      else if (data === "cancel_order") {
-        USER_STATE.delete(userId);
-        await tg(env, "sendMessage", { chat_id: chatId, text: "Pesanan dibatalkan 🙏 Jika ingin pesan ulang, silakan chat lagi." });
+      // cancel_order (user clicked cancel on confirmation)
+      if (data === "cancel_order") {
+        USER_STATE.delete(fromId);
+        await tg(env, "sendMessage", { chat_id, text: "Pesanan dibatalkan 🙏 Jika ingin pesan ulang, silakan chat lagi." });
         return new Response("OK");
+      }
+
+      // ADMIN callbacks: admin_approve|INV, admin_reject|INV, admin_cancel|INV
+      if (data.startsWith("admin_approve|") || data.startsWith("admin_reject|") || data.startsWith("admin_cancel|")) {
+        const [cmd, invId] = data.split("|");
+        const order = ORDERS.get(invId);
+        if (!order) {
+          await tg(env, "sendMessage", { chat_id, text: `Order ${invId} tidak ditemukan atau sudah diproses.` });
+          return new Response("OK");
+        }
+
+        // Only allow admin (simple check). Admin user id can be provided via ADMIN_USER_ID env (optional).
+        const adminUserId = env.ADMIN_USER_ID ? Number(env.ADMIN_USER_ID) : null;
+        if (adminUserId && Number(fromId) !== adminUserId) {
+          await tg(env, "sendMessage", { chat_id, text: "Anda tidak punya izin untuk melakukan aksi ini." });
+          return new Response("OK");
+        }
+
+        if (cmd === "admin_approve") {
+          order.status = "approved";
+          ORDERS.set(invId, order);
+          // notify user
+          await tg(env, "sendMessage", {
+            chat_id: order.chatId,
+            text: `✅ Pesanan Anda (ID: ${invId}) telah *DISETUJUI* oleh admin.\nAdmin akan menghubungi untuk konfirmasi selanjutnya.`,
+            parse_mode: "Markdown"
+          });
+          await tg(env, "sendMessage", { chat_id, cb.message.chat.id, text: `Order ${invId} approved.` });
+          return new Response("OK");
+        }
+
+        if (cmd === "admin_reject") {
+          order.status = "rejected";
+          ORDERS.set(invId, order);
+          await tg(env, "sendMessage", {
+            chat_id: order.chatId,
+            text: `❌ Maaf, pesanan Anda (ID: ${invId}) *DITOLAK* oleh admin. Silakan hubungi kami jika perlu penjelasan.`,
+            parse_mode: "Markdown"
+          });
+          await tg(env, "sendMessage", { chat_id: cb.message.chat.id, text: `Order ${invId} rejected.` });
+          return new Response("OK");
+        }
+
+        if (cmd === "admin_cancel") {
+          order.status = "cancelled";
+          ORDERS.set(invId, order);
+          await tg(env, "sendMessage", {
+            chat_id: order.chatId,
+            text: `⚠️ Pesanan Anda (ID: ${invId}) dibatalkan oleh admin.`,
+            parse_mode: "Markdown"
+          });
+          await tg(env, "sendMessage", { chat_id: cb.message.chat.id, text: `Order ${invId} cancelled by admin.` });
+          return new Response("OK");
+        }
       }
 
       return new Response("OK");
     } // end callback_query
 
-    // MESSAGE handler (text commands + normal flow)
+    // MESSAGE handler
     const msg = update.message;
     if (!msg || !msg.text) return new Response("OK");
-
     const chatId = msg.chat.id;
-    const userId = msg.from.id;
+    const fromId = msg.from.id;
     const text = msg.text.trim();
 
     // Commands: /status <id>
@@ -198,7 +293,7 @@ export default {
       const parts = text.split(/\s+/);
       const id = parts[1];
       if (!id) {
-        await tg(env, "sendMessage", { chat_id: chatId, text: "Gunakan: /status <INVOICE_ID>\nContoh: /status INVXXXXX" });
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Gunakan: /status <INVOICE_ID>\nContoh: /status INVXXXX" });
         return new Response("OK");
       }
       const order = ORDERS.get(id);
@@ -206,13 +301,14 @@ export default {
         await tg(env, "sendMessage", { chat_id: chatId, text: `Order dengan ID ${id} tidak ditemukan.` });
         return new Response("OK");
       }
-      // only owner (or admin in future) can view
-      if (order.userId !== userId) {
-        await tg(env, "sendMessage", { chat_id: chatId, text: `Anda tidak punya izin melihat order ini.` });
+      // only owner or admin (ADMIN_USER_ID) can view details
+      const adminUserId = env.ADMIN_USER_ID ? Number(env.ADMIN_USER_ID) : null;
+      if (order.userId !== fromId && adminUserId !== fromId) {
+        await tg(env, "sendMessage", { chat_id, text: `Anda tidak punya izin melihat order ini.` });
         return new Response("OK");
       }
       await tg(env, "sendMessage", {
-        chat_id: chatId,
+        chat_id,
         text:
           `🧾 Status Order (ID: *${order.id}*)\n\n` +
           `Produk: *${order.name}*\nJumlah: ${order.qty}\nTotal: ${formatRupiah(order.total)}\nStatus: *${order.status}*\nDibuat: ${order.createdAt}`,
@@ -226,45 +322,52 @@ export default {
       const parts = text.split(/\s+/);
       const id = parts[1];
       if (!id) {
-        await tg(env, "sendMessage", { chat_id: chatId, text: "Gunakan: /cancel <INVOICE_ID>\nContoh: /cancel INVXXXXX" });
+        await tg(env, "sendMessage", { chat_id, text: "Gunakan: /cancel <INVOICE_ID>\nContoh: /cancel INVXXXX" });
         return new Response("OK");
       }
       const order = ORDERS.get(id);
       if (!order) {
-        await tg(env, "sendMessage", { chat_id: chatId, text: `Order dengan ID ${id} tidak ditemukan.` });
+        await tg(env, "sendMessage", { chat_id, text: `Order dengan ID ${id} tidak ditemukan.` });
         return new Response("OK");
       }
-      // allow only owner to cancel (admin logic can be added)
-      if (order.userId !== userId) {
-        await tg(env, "sendMessage", { chat_id: chatId, text: `Anda tidak punya izin membatalkan order ini.` });
+      const adminUserId = env.ADMIN_USER_ID ? Number(env.ADMIN_USER_ID) : null;
+      if (order.userId !== fromId && adminUserId !== fromId) {
+        await tg(env, "sendMessage", { chat_id, text: `Anda tidak punya izin membatalkan order ini.` });
         return new Response("OK");
       }
       if (order.status === "cancelled") {
-        await tg(env, "sendMessage", { chat_id: chatId, text: `Order ${id} sudah dibatalkan sebelumnya.` });
+        await tg(env, "sendMessage", { chat_id, text: `Order ${id} sudah dibatalkan sebelumnya.` });
         return new Response("OK");
       }
       order.status = "cancelled";
       ORDERS.set(id, order);
-      await tg(env, "sendMessage", { chat_id: chatId, text: `Order ${id} berhasil dibatalkan.` });
-      // (Optional) notify admin
+      await tg(env, "sendMessage", { chat_id, text: `Order ${id} berhasil dibatalkan.` });
+      // notify admin optionally
+      if (env.ADMIN_CHAT_ID) {
+        await tg(env, "sendMessage", { chat_id: env.ADMIN_CHAT_ID, text: `Order ${id} dibatalkan oleh ${fromId}.` }).catch(()=>{});
+      }
       return new Response("OK");
     }
 
-    // If user is in state asking quantity and message is a plain number -> go to confirmation step
-    const state = USER_STATE.get(userId);
+    // If user in flow: qty input
+    const state = USER_STATE.get(fromId);
     if (state?.step === "qty" && /^\d+$/.test(text)) {
       const qty = Number(text);
-      if (!state.product || !PRODUCTS[state.product]) {
-        USER_STATE.delete(userId);
-        await tg(env, "sendMessage", { chat_id: chatId, text: "Produk tidak ditemukan. Silakan mulai ulang." });
+      const productKey = state.product;
+      const p = PRODUCTS[productKey];
+      if (!p) {
+        USER_STATE.delete(fromId);
+        await tg(env, "sendMessage", { chat_id, text: "Produk tidak ditemukan. Silakan mulai ulang." });
         return new Response("OK");
       }
-      const p = PRODUCTS[state.product];
-      // save qty and go to confirm_qty
-      USER_STATE.set(userId, { step: "confirm_qty", product: state.product, qty });
 
+      // Create confirmation buttons that encode all needed data in callback_data
+      // Format: confirm_order|productKey|qty|userId
+      const callbackData = `confirm_order|${productKey}|${qty}|${fromId}`;
+
+      // show confirmation
       await tg(env, "sendMessage", {
-        chat_id: chatId,
+        chat_id,
         text:
           `🔍 *Konfirmasi Pesanan*\n\n` +
           `Produk: *${p.name}*\n` +
@@ -275,22 +378,23 @@ export default {
         parse_mode: "Markdown",
         reply_markup: {
           inline_keyboard: [
-            [{ text: "✅ Ya, Konfirmasi", callback_data: "confirm_order" }],
+            [{ text: "✅ Ya, Konfirmasi", callback_data: callbackData }],
             [{ text: "❌ Batal", callback_data: "cancel_order" }]
           ]
         }
       });
+
+      // keep small state if you want; not required for final confirmation
+      USER_STATE.set(fromId, { step: "confirm_qty", product: productKey, qty });
       return new Response("OK");
     }
 
     // General inquiry: show menu (image + buttons)
-    // Trigger by keywords or any message when not mid-flow
     const lower = text.toLowerCase();
     if (lower.includes("roti") || lower.includes("menu") || lower.includes("ada")) {
-      // build product buttons from PRODUCTS
       const buttons = Object.values(PRODUCTS).map(p => [{ text: p.name, callback_data: `menu_${p.key}` }]);
       await tg(env, "sendPhoto", {
-        chat_id: chatId,
+        chat_id,
         photo: MENU_IMAGE,
         caption: "🍞 *Menu Roti Hari Ini*\nSilakan pilih roti di bawah 👇",
         parse_mode: "Markdown",
@@ -301,8 +405,8 @@ export default {
 
     // Default fallback (human)
     await tg(env, "sendMessage", {
-      chat_id: chatId,
-      text: "Terima kasih kak 🙏\nPesan ini akan dibantu admin secara manual. Jika mau lihat pesanan: gunakan /status <ID> atau batalkan /cancel <ID> (jika Anda pemilik)."
+      chat_id,
+      text: "Terima kasih kak 🙏\nPesan ini akan dibantu admin secara manual. Untuk memeriksa pesanan: /status <ID> atau batalkan /cancel <ID>."
     });
 
     return new Response("OK");
