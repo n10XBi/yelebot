@@ -1,206 +1,111 @@
 const USER_STATE = new Map();
 
-// ==========================
-// CONFIG
-// ==========================
-const WORK_START = 8;   // 08:00
-const WORK_END = 17;    // 17:00
-const TZ_OFFSET = 7;    // WIB
+const MENU_IMAGE = "https://lh3.googleusercontent.com/86arOE_jc_FYR6_mPbeXrzWB4LwvgCRWPGXbbftgG4_zAjY05ajbmq3xiG0Xc_uYCoTccikGvLdo5WIlofH5pmySn1VRejqngh2pwDLquiLJYayCOJKUrZKFnOwmSxKzQqqOM1y5o42TPk6LYR1vbPjrEPx3dQIUEwS4IPRjzt3JdPZT32TkqCECm-PoQtsBAPnyN6g46PbiyD9fblgzuBcT2xuO1AaZgOkR53bom8ATCBkDgcYT_mnsxWuxLGp6cNFUR4lWBFKyYkYJWJY--KmIVCWDDoJ3SxwjimGjwRG-X2Qu3AP4wa6tRazHuBo3a8IOofm6f5arSRdpVy4AaXoacTPz8TSkcofA0YaIttHpek1Gi5v1yMSbi5mHV6Mfv4lyczXPp8c5iNR7IFPvgMz1BiCETTxNwSvDjb2JCN94_256Fzejrs-Dk-kMYeCCYQh2Zd_lt9xiEQDgZ5gufdpxxM9xDiP447vrOqKbBMcAS_6hu43EwRi97ILAhBpS3QLP-4WhKf4GHauWqML_EcBvhszB-6T1iGeCWvpAT9jZVDVgekalBvLZiZNoy5Ow9QlnHA=w1827-h711-no";
 
-// ==========================
-// DB JSON (TMP)
-// ==========================
 const PRODUCTS = {
-  roti_coklat: {
-    name: "Roti Coklat",
-    desc: "Roti lembut dengan isian coklat manis",
-    price: 8000,
-    image: "https://via.placeholder.com/400x300?text=Roti+Coklat"
-  },
-  roti_keju: {
-    name: "Roti Keju",
-    desc: "Roti lembut dengan topping keju gurih",
-    price: 9000,
-    image: "https://via.placeholder.com/400x300?text=Roti+Keju"
-  },
-  roti_premium: {
+  premium: {
     name: "Roti Premium",
     desc: "Roti premium tanpa kulit dengan topping coklat & keju",
-    price: 12000,
-    image: "https://via.placeholder.com/400x300?text=Roti+Premium"
+    price: 12000
   }
 };
 
-// ==========================
-// UTIL
-// ==========================
-function isWorkingHour() {
-  const now = new Date(Date.now() + TZ_OFFSET * 3600000);
-  const h = now.getUTCHours();
-  return h >= WORK_START && h < WORK_END;
-}
-
-function formatRupiah(num) {
-  return "Rp" + num.toLocaleString("id-ID");
-}
-
-// ==========================
-// SENDERS
-// ==========================
-async function sendMessage(env, chatId, text, keyboard = null) {
-  await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
+async function tg(env, method, data) {
+  await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      reply_markup: keyboard,
-      parse_mode: "Markdown"
-    })
+    body: JSON.stringify(data)
   });
 }
 
-async function sendPhoto(env, chatId, photo, caption, keyboard = null) {
-  await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendPhoto`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      photo,
-      caption,
-      reply_markup: keyboard,
-      parse_mode: "Markdown"
-    })
-  });
-}
-
-// ==========================
-// WORKER
-// ==========================
 export default {
   async fetch(req, env) {
     if (req.method !== "POST") return new Response("OK");
-
     const update = await req.json();
-    const msg = update.message;
-    const cb = update.callback_query;
 
-    const chatId = msg?.chat.id || cb?.message.chat.id;
-    const userId = msg?.from.id || cb?.from.id;
-    const text = msg?.text?.toLowerCase();
+    /* ================= CALLBACK ================= */
+    if (update.callback_query) {
+      const cb = update.callback_query;
+      const chatId = cb.message.chat.id;
+      const userId = cb.from.id;
 
-    if (!chatId || !userId) return new Response("OK");
+      // WAJIB! kalau ini tidak ada → tombol mati
+      await tg(env, "answerCallbackQuery", {
+        callback_query_id: cb.id
+      });
 
-    let state = USER_STATE.get(userId) || {};
+      if (cb.data === "menu_premium") {
+        USER_STATE.set(userId, { step: "interest", product: "premium" });
 
-    // ======================
-    // CALLBACK HANDLER
-    // ======================
-    if (cb) {
-      const data = cb.data;
-
-      if (data.startsWith("select_")) {
-        const key = data.replace("select_", "");
-        const p = PRODUCTS[key];
-
-        state.product = key;
-        state.step = "confirm_interest";
-        USER_STATE.set(userId, state);
-
-        await sendPhoto(
-          env,
-          chatId,
-          p.image,
-          `*${p.name}*\n\n${p.desc}\n\n💰 Harga: ${formatRupiah(p.price)}\n\nApakah Anda tertarik memesan?`,
-          {
+        const p = PRODUCTS.premium;
+        await tg(env, "sendMessage", {
+          chat_id: chatId,
+          text:
+            `🥖 *${p.name}*\n\n${p.desc}\n💰 Rp${p.price}\n\nApakah ingin memesan?`,
+          parse_mode: "Markdown",
+          reply_markup: {
             inline_keyboard: [
-              [{ text: "✅ Ya", callback_data: "yes_interest" }],
-              [{ text: "❌ Tidak", callback_data: "no_interest" }]
+              [{ text: "✅ Ya", callback_data: "yes" }],
+              [{ text: "❌ Tidak", callback_data: "no" }]
             ]
           }
-        );
+        });
       }
 
-      else if (data === "yes_interest") {
-        const p = PRODUCTS[state.product];
-        state.step = "confirm_order";
-        USER_STATE.set(userId, state);
-
-        await sendMessage(
-          env,
-          chatId,
-          `Mohon konfirmasi pesanan 🙏\n\n📦 *${p.name}*\n📝 ${p.desc}\n💰 ${formatRupiah(p.price)}`,
-          {
-            inline_keyboard: [
-              [{ text: "➡️ Lanjut", callback_data: "order_continue" }],
-              [{ text: "❌ Batal", callback_data: "order_cancel" }]
-            ]
-          }
-        );
+      if (cb.data === "yes") {
+        USER_STATE.set(userId, { step: "qty", product: "premium" });
+        await tg(env, "sendMessage", {
+          chat_id: chatId,
+          text: "Mau pesan berapa buah?"
+        });
       }
 
-      else if (data === "order_continue") {
-        state.step = "ask_qty";
-        USER_STATE.set(userId, state);
-        await sendMessage(env, chatId, "Mau pesan berapa buah?");
-      }
-
-      else if (data === "order_cancel" || data === "no_interest") {
+      if (cb.data === "no") {
         USER_STATE.delete(userId);
-        await sendMessage(env, chatId, "Baik kak 🙏 Jika butuh bantuan lain, silakan chat lagi.");
+        await tg(env, "sendMessage", {
+          chat_id: chatId,
+          text: "Siap kak 🙏 Kalau butuh silakan chat lagi."
+        });
       }
 
       return new Response("OK");
     }
 
-    // ======================
-    // TEXT HANDLER
-    // ======================
-    if (!isWorkingHour()) {
-      await sendMessage(
-        env,
-        chatId,
-        "⏰ Kami sedang di luar jam kerja.\nPesan akan dibalas admin pada jam *08.00 WIB* 🙏"
-      );
-    }
+    /* ================= MESSAGE ================= */
+    const msg = update.message;
+    if (!msg?.text) return new Response("OK");
 
-    // Step: qty
-    if (state.step === "ask_qty" && /^\d+$/.test(text)) {
-      const qty = parseInt(text);
-      const p = PRODUCTS[state.product];
-      const total = qty * p.price;
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const text = msg.text.toLowerCase();
+    const state = USER_STATE.get(userId);
 
+    if (state?.step === "qty" && /^\d+$/.test(text)) {
+      const qty = Number(text);
+      const p = PRODUCTS.premium;
       USER_STATE.delete(userId);
 
-      await sendMessage(
-        env,
-        chatId,
-        `🧾 *Invoice Sementara*\n\nProduk: ${p.name}\nJumlah: ${qty}\nHarga: ${formatRupiah(p.price)}\n\n*Total: ${formatRupiah(total)}*\n\n⏳ Admin akan mengonfirmasi pesanan Anda.`
-      );
+      await tg(env, "sendMessage", {
+        chat_id: chatId,
+        text:
+          `🧾 *Invoice Sementara*\n\nProduk: ${p.name}\nJumlah: ${qty}\nTotal: Rp${qty * p.price}\n\nAdmin akan konfirmasi 🙏`,
+        parse_mode: "Markdown"
+      });
       return new Response("OK");
     }
 
-    // General inquiry
-    if (text?.includes("roti") || text?.includes("ada")) {
-      const buttons = Object.entries(PRODUCTS).map(([k, p]) => ([
-        { text: p.name, callback_data: `select_${k}` }
-      ]));
-
-      await sendMessage(
-        env,
-        chatId,
-        "Masih kak 😊\nRoti yang tersedia hari ini:",
-        { inline_keyboard: buttons }
-      );
-      return new Response("OK");
-    }
-
-    // Fallback
-    await sendMessage(
-      env,
-      chatId,
-      "Terima kasih kak 🙏\nPesan ini akan dibantu admin secara manual."
-    );
+    // MENU AWAL (gambar + tombol)
+    await tg(env, "sendPhoto", {
+      chat_id: chatId,
+      photo: MENU_IMAGE,
+      caption: "🍞 *Menu Roti Hari Ini*\nSilakan pilih roti di bawah 👇",
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🥖 Roti Premium", callback_data: "menu_premium" }]
+        ]
+      }
+    });
 
     return new Response("OK");
   }
