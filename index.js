@@ -1,20 +1,22 @@
-// worker.js — Telegram Worker (full, stateless callbacks, admin approve/reject, cancel by ID)
+// worker-updated.js — Telegram Worker (with admin product management)
 // Env required: BOT_TOKEN, ADMIN_CHAT_ID (chat id where admin will get notifications)
 // Optional: ADMIN_USER_ID (telegram numeric id for admin user, used for permission checking)
 
-const USER_STATE = new Map(); // temporary per-user flow (safe to use for in-flow, but not for final confirm)
-const ORDERS = new Map(); // invoiceId -> order object (in-memory)
+let USER_STATE = new Map(); // temporary per-user flow
+let ORDERS = new Map(); // invoiceId -> order object (in-memory)
 
 // CONFIG
-const MENU_IMAGE = "https://lh3.googleusercontent.com/86arOE_jc_FYR6_mPbeXrzWB4LwvgCRWPGXbbftgG4_zAjY05ajbmq3xiG0Xc_uYCoTccikGvLdo5WIlofH5pmySn1VRejqngh2pwDLquiLJYayCOJKUrZKFnOwmSxKzQqqOM1y5o42TPk6LYR1vbPjrEPx3dQIUEwS4IPRjzt3JdPZT32TkqCECm-PoQtsBAPnyN6g46PbiyD9fblgzuBcT2xuO1AaZgOkR53bom8ATCBkDgcYT_mnsxWuxLGp6cNFUR4lWBFKyYkYJWJY--KmIVCWDDoJ3SxwjimGjwRG-X2Qu3AP4wa6tRazHuBo3a8IOofm6f5arSRdpVy4AaXoacTPz8TSkcofA0YaIttHpek1Gi5v1yMSbi5mHV6Mfv4lyczXPp8c5iNR7IFPvgMz1BiCETTxNwSvDjb2JCN94_256Fzejrs-Dk-kMYeCCYQh2Zd_lt9xiEQDgZ5gufdpxxM9xDiP447vrOqKbBMcAS_6hu43EwRi97ILAhBpS3QLP-4WhKf4GHauWqML_EcBvhszB-6T1iGeCWvpAT9jZVDVgekalBvLZiZNoy5Ow9QlnHA=w1827-h711-no";
+const MENU_IMAGE = "https://lh3.googleusercontent.com/86arOE_jc_FYR6_mPbeXrzWB4LwvgCRWPGXbbftgG4_zAjY05ajbmq3xiG0Xc_uYCoTccikGvLdo5WIlofH5pmySn1VRejqngh2pwDLquiLJYayCOJKUrZKFnOwmSxKzQqqOM1y5o42TPk6LYR1vbPjrEPx3JdPZT32TkqCECm-PoQtsBAPnyN6g46PbiyD9fblgzuBcT2xuO1AaZgOkR53bom8ATCBkDgcYT_mnsxWuxLGp6cNFUR4lWBFKyYkYJWJY--KmIVCWDDoJ3SxwjimGjwRG-X2Qu3AP4wa6tRazHuBo3a8IOofm6f5arSRdpVy4AaXoacTPz8TSkcofA0YaIttHpek1Gi5v1yMSbi5mHV6Mfv4lyczXPp8c5iNR7IFPvgMz1BiCETTxNwSvDjb2JCN94_256Fzejrs-Dk-kMYeCCYQh2Zd_lt9xiEQDgZ5gufdpxxM9xDiP447vrOqKbBMcAS_6hu43EwRi97ILAhBpS3QLP-4WhKf4GHauWqML_EcBvhszB-6T1iGeCWvpAT9jZVDVgekalBvLZiZNoy5Ow9QlnHA=w1827-h711-no";
 
-const PRODUCTS = {
+// Mutable product store (in-memory)
+let PRODUCTS = {
   premium: {
     key: "premium",
     name: "Roti Premium",
     desc: "Roti premium tanpa kulit dengan topping coklat & keju",
     price: 12000,
-    image: MENU_IMAGE
+    image: MENU_IMAGE,
+    stock: 10
   }
 };
 
@@ -29,16 +31,24 @@ function getWIBDate() {
   const utc = now.getTime() + now.getTimezoneOffset() * 60000;
   return new Date(utc + TZ_OFFSET * 3600000);
 }
+
 function isWorkingHour() {
   const d = getWIBDate();
   const h = d.getHours();
   return h >= WORK_START && h < WORK_END;
 }
+
 function formatRupiah(num) {
   return "Rp" + Number(num).toLocaleString("id-ID");
 }
+
 function generateInvoiceId() {
   return "INV" + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2,6).toUpperCase();
+}
+
+function isAdmin(userId, env) {
+  const adminUserId = env.ADMIN_USER_ID ? Number(env.ADMIN_USER_ID) : null;
+  return adminUserId && Number(userId) === adminUserId;
 }
 
 // Telegram helper
@@ -60,14 +70,13 @@ async function tg(env, method, data) {
 async function notifyAdmin(env, order) {
   const adminChat = env.ADMIN_CHAT_ID;
   if (!adminChat) return;
-  const text =
-    `🔔 *New Order* (ID: ${order.id})\n\n` +
-    `User: ${order.userId}\n` +
-    `Produk: *${order.name}*\n` +
-    `Jumlah: ${order.qty}\n` +
-    `Total: *${formatRupiah(order.total)}*\n` +
-    `Dibuat: ${order.createdAt}\n\n` +
-    `Tekan Approve untuk setujui, Reject untuk tolak.`;
+  const text = `🔔 *New Order* (ID: ${order.id})\n\n` +
+               `User: ${order.userId}\n` +
+               `Produk: *${order.name}*\n` +
+               `Jumlah: ${order.qty}\n` +
+               `Total: *${formatRupiah(order.total)}*\n` +
+               `Dibuat: ${order.createdAt}\n\n` +
+               `Tekan Approve untuk setujui, Reject untuk tolak.`;
   await tg(env, "sendMessage", {
     chat_id: adminChat,
     text,
@@ -117,9 +126,9 @@ export default {
         }
         USER_STATE.set(fromId, { step: "interest", product: key });
         await tg(env, "sendPhoto", {
-          chat_id,
-          photo: p.image,
-          caption: `🥖 *${p.name}*\n\n${p.desc}\n\n💰 *${formatRupiah(p.price)}*\n\nApakah Anda ingin memesan?`,
+          chat_id: chatId,
+          photo: p.image || MENU_IMAGE,
+          caption: `🥖 *${p.name}*\n\n${p.desc}\n\n💰 *${formatRupiah(p.price)}*\n\nStok: *${p.stock ?? 0}*\n\nApakah Anda ingin memesan?`,
           parse_mode: "Markdown",
           reply_markup: {
             inline_keyboard: [
@@ -136,14 +145,14 @@ export default {
         const parts = data.split("|");
         const key = parts[1]; // product
         USER_STATE.set(fromId, { step: "qty", product: key });
-        await tg(env, "sendMessage", { chat_id, text: "Mau pesan berapa buah?" });
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Mau pesan berapa buah?" });
         return new Response("OK");
       }
 
       // no_interest -> cancel
       if (data === "no_interest") {
         USER_STATE.delete(fromId);
-        await tg(env, "sendMessage", { chat_id, text: "Siap kak 🙏 Kalau butuh silakan chat lagi." });
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Siap kak 🙏 Kalau butuh silakan chat lagi." });
         return new Response("OK");
       }
 
@@ -158,7 +167,17 @@ export default {
 
         const p = PRODUCTS[productKey];
         if (!p || !qty || !origUserId) {
-          await tg(env, "sendMessage", { chat_id, text: "Maaf, data pesanan tidak valid. Silakan mulai ulang." });
+          await tg(env, "sendMessage", { chat_id: chatId, text: "Maaf, data pesanan tidak valid. Silakan mulai ulang." });
+          return new Response("OK");
+        }
+
+        // check stock
+        if ((p.stock ?? 0) < qty) {
+          await tg(env, "sendMessage", { 
+            chat_id: chatId, 
+            text: `Maaf, stok untuk *${p.name}* tidak mencukupi. Stok saat ini: ${p.stock ?? 0}.`, 
+            parse_mode: "Markdown" 
+          });
           return new Response("OK");
         }
 
@@ -184,7 +203,7 @@ export default {
         // notify user invoice created
         if (isWorkingHour()) {
           await tg(env, "sendMessage", {
-            chat_id,
+            chat_id: chatId,
             text:
               `🧾 *Invoice Sementara* (ID: *${invId}*)\n\n` +
               `Produk: *${order.name}*\nJumlah: ${order.qty}\nHarga satuan: ${formatRupiah(order.price)}\n\n*Total: ${formatRupiah(order.total)}*\n\n` +
@@ -199,7 +218,7 @@ export default {
           confirmAt.setHours(WORK_START, 0, 0, 0);
           const confirmAtStr = confirmAt.toLocaleString("id-ID");
           await tg(env, "sendMessage", {
-            chat_id,
+            chat_id: chatId,
             text:
               `🧾 *Invoice Sementara* (ID: *${invId}*)\n\n` +
               `Produk: *${order.name}*\nJumlah: ${order.qty}\nHarga satuan: ${formatRupiah(order.price)}\n\n*Total: ${formatRupiah(order.total)}*\n\n` +
@@ -220,7 +239,7 @@ export default {
       // cancel_order (user clicked cancel on confirmation)
       if (data === "cancel_order") {
         USER_STATE.delete(fromId);
-        await tg(env, "sendMessage", { chat_id, text: "Pesanan dibatalkan 🙏 Jika ingin pesan ulang, silakan chat lagi." });
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Pesanan dibatalkan 🙏 Jika ingin pesan ulang, silakan chat lagi." });
         return new Response("OK");
       }
 
@@ -229,27 +248,47 @@ export default {
         const [cmd, invId] = data.split("|");
         const order = ORDERS.get(invId);
         if (!order) {
-          await tg(env, "sendMessage", { chat_id, text: `Order ${invId} tidak ditemukan atau sudah diproses.` });
+          await tg(env, "sendMessage", { chat_id: chatId, text: `Order ${invId} tidak ditemukan atau sudah diproses.` });
           return new Response("OK");
         }
 
         // Only allow admin (simple check). Admin user id can be provided via ADMIN_USER_ID env (optional).
         const adminUserId = env.ADMIN_USER_ID ? Number(env.ADMIN_USER_ID) : null;
         if (adminUserId && Number(fromId) !== adminUserId) {
-          await tg(env, "sendMessage", { chat_id, text: "Anda tidak punya izin untuk melakukan aksi ini." });
+          await tg(env, "sendMessage", { chat_id: chatId, text: "Anda tidak punya izin untuk melakukan aksi ini." });
           return new Response("OK");
         }
 
         if (cmd === "admin_approve") {
+          // reduce stock when approving
+          const prod = PRODUCTS[order.product];
+          if (!prod) {
+            await tg(env, "sendMessage", { chat_id: chatId, text: `Produk untuk order ${invId} tidak ditemukan.` });
+            return new Response("OK");
+          }
+          if ((prod.stock ?? 0) < order.qty) {
+            order.status = "rejected";
+            ORDERS.set(invId, order);
+            await tg(env, "sendMessage", {
+              chat_id: order.chatId,
+              text: `❌ Maaf, pesanan Anda (ID: ${invId}) tidak dapat diproses karena stok kurang. Silakan hubungi admin.`,
+              parse_mode: "Markdown"
+            });
+            await tg(env, "sendMessage", { chat_id: chatId, text: `Order ${invId} rejected due to insufficient stock.` });
+            return new Response("OK");
+          }
+
+          prod.stock = (prod.stock ?? 0) - order.qty;
           order.status = "approved";
           ORDERS.set(invId, order);
+
           // notify user
           await tg(env, "sendMessage", {
             chat_id: order.chatId,
-            text: `✅ Pesanan Anda (ID: ${invId}) telah *DISETUJUI* oleh admin.\nAdmin akan menghubungi untuk konfirmasi selanjutnya.`,
+            text: `✅ Pesanan Anda (ID: ${invId}) telah *DISETUJUI* oleh admin.\nAdmin akan menghubungi untuk konfirmasi selanjutnya.\nSisa stok ${prod.name}: *${prod.stock}*`,
             parse_mode: "Markdown"
           });
-          await tg(env, "sendMessage", { chat_id, cb.message.chat.id, text: `Order ${invId} approved.` });
+          await tg(env, "sendMessage", { chat_id: chatId, text: `Order ${invId} approved.` });
           return new Response("OK");
         }
 
@@ -261,7 +300,7 @@ export default {
             text: `❌ Maaf, pesanan Anda (ID: ${invId}) *DITOLAK* oleh admin. Silakan hubungi kami jika perlu penjelasan.`,
             parse_mode: "Markdown"
           });
-          await tg(env, "sendMessage", { chat_id: cb.message.chat.id, text: `Order ${invId} rejected.` });
+          await tg(env, "sendMessage", { chat_id: chatId, text: `Order ${invId} rejected.` });
           return new Response("OK");
         }
 
@@ -273,7 +312,7 @@ export default {
             text: `⚠️ Pesanan Anda (ID: ${invId}) dibatalkan oleh admin.`,
             parse_mode: "Markdown"
           });
-          await tg(env, "sendMessage", { chat_id: cb.message.chat.id, text: `Order ${invId} cancelled by admin.` });
+          await tg(env, "sendMessage", { chat_id: chatId, text: `Order ${invId} cancelled by admin.` });
           return new Response("OK");
         }
       }
@@ -287,6 +326,133 @@ export default {
     const chatId = msg.chat.id;
     const fromId = msg.from.id;
     const text = msg.text.trim();
+
+    // Admin-only helpers via text commands
+    // /addproduct key|name|desc|price|stock|image(optional)
+    if (text.startsWith("/addproduct")) {
+      if (!isAdmin(fromId, env)) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Hanya admin yang dapat menambah produk." });
+        return new Response("OK");
+      }
+      const payload = text.replace(/\/addproduct\s*/i, "").trim();
+      const parts = payload.split("|").map(s=>s.trim());
+      if (parts.length < 5) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Format: /addproduct key|Nama Produk|Deskripsi|harga|stok|image(optional)" });
+        return new Response("OK");
+      }
+      const [key, name, desc, priceStr, stockStr, image] = parts;
+      const price = Number(priceStr.replace(/[^0-9]/g, "")) || 0;
+      const stock = Number(stockStr) || 0;
+      PRODUCTS[key] = { key, name, desc, price, image: image || MENU_IMAGE, stock };
+      await tg(env, "sendMessage", { chat_id: chatId, text: `Produk *${name}* berhasil ditambahkan (key: ${key}).`, parse_mode: "Markdown" });
+      return new Response("OK");
+    }
+
+    // /addstock key qty  -> menambah stok
+    if (text.startsWith("/addstock")) {
+      if (!isAdmin(fromId, env)) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Hanya admin yang dapat mengubah stok." });
+        return new Response("OK");
+      }
+      const parts = text.split(/\s+/);
+      if (parts.length < 3) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Format: /addstock <key> <qty>" });
+        return new Response("OK");
+      }
+      const key = parts[1];
+      const qty = Number(parts[2]);
+      const p = PRODUCTS[key];
+      if (!p) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: `Produk dengan key ${key} tidak ditemukan.` });
+        return new Response("OK");
+      }
+      p.stock = (p.stock ?? 0) + qty;
+      await tg(env, "sendMessage", { chat_id: chatId, text: `Stok ${p.name} berhasil ditambah. Stok sekarang: ${p.stock}.` });
+      return new Response("OK");
+    }
+
+    // /editstock key qty -> set stok
+    if (text.startsWith("/editstock")) {
+      if (!isAdmin(fromId, env)) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Hanya admin yang dapat mengubah stok." });
+        return new Response("OK");
+      }
+      const parts = text.split(/\s+/);
+      if (parts.length < 3) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Format: /editstock <key> <qty>" });
+        return new Response("OK");
+      }
+      const key = parts[1];
+      const qty = Number(parts[2]);
+      const p = PRODUCTS[key];
+      if (!p) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: `Produk dengan key ${key} tidak ditemukan.` });
+        return new Response("OK");
+      }
+      p.stock = qty;
+      await tg(env, "sendMessage", { chat_id: chatId, text: `Stok ${p.name} diset menjadi ${p.stock}.` });
+      return new Response("OK");
+    }
+
+    // /editprice key newPrice
+    if (text.startsWith("/editprice")) {
+      if (!isAdmin(fromId, env)) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Hanya admin yang dapat mengubah harga." });
+        return new Response("OK");
+      }
+      const parts = text.split(/\s+/);
+      if (parts.length < 3) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Format: /editprice <key> <harga>" });
+        return new Response("OK");
+      }
+      const key = parts[1];
+      const price = Number(parts[2].replace(/[^0-9]/g, "")) || 0;
+      const p = PRODUCTS[key];
+      if (!p) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: `Produk dengan key ${key} tidak ditemukan.` });
+        return new Response("OK");
+      }
+      p.price = price;
+      await tg(env, "sendMessage", { chat_id: chatId, text: `Harga ${p.name} diset menjadi ${formatRupiah(p.price)}.` });
+      return new Response("OK");
+    }
+
+    // /delproduct key
+    if (text.startsWith("/delproduct")) {
+      if (!isAdmin(fromId, env)) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Hanya admin yang dapat menghapus produk." });
+        return new Response("OK");
+      }
+      const parts = text.split(/\s+/);
+      if (parts.length < 2) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Format: /delproduct <key>" });
+        return new Response("OK");
+      }
+      const key = parts[1];
+      const p = PRODUCTS[key];
+      if (!p) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: `Produk dengan key ${key} tidak ditemukan.` });
+        return new Response("OK");
+      }
+      delete PRODUCTS[key];
+      await tg(env, "sendMessage", { chat_id: chatId, text: `Produk ${p.name} (key: ${key}) berhasil dihapus.` });
+      return new Response("OK");
+    }
+
+    // /products -> daftar produk beserta stok
+    if (text.startsWith("/products")) {
+      const list = Object.values(PRODUCTS);
+      if (!list.length) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Belum ada produk." });
+        return new Response("OK");
+      }
+      let msg = "📦 *Daftar Produk*\n\n";
+      list.forEach(p => {
+        msg += `• *${p.name}* (key: ${p.key})\n  Harga: ${formatRupiah(p.price)}\n  Stok: ${p.stock ?? 0}\n\n`;
+      });
+      await tg(env, "sendMessage", { chat_id: chatId, text: msg, parse_mode: "Markdown" });
+      return new Response("OK");
+    }
 
     // Commands: /status <id>
     if (text.startsWith("/status")) {
@@ -304,11 +470,11 @@ export default {
       // only owner or admin (ADMIN_USER_ID) can view details
       const adminUserId = env.ADMIN_USER_ID ? Number(env.ADMIN_USER_ID) : null;
       if (order.userId !== fromId && adminUserId !== fromId) {
-        await tg(env, "sendMessage", { chat_id, text: `Anda tidak punya izin melihat order ini.` });
+        await tg(env, "sendMessage", { chat_id: chatId, text: `Anda tidak punya izin melihat order ini.` });
         return new Response("OK");
       }
       await tg(env, "sendMessage", {
-        chat_id,
+        chat_id: chatId,
         text:
           `🧾 Status Order (ID: *${order.id}*)\n\n` +
           `Produk: *${order.name}*\nJumlah: ${order.qty}\nTotal: ${formatRupiah(order.total)}\nStatus: *${order.status}*\nDibuat: ${order.createdAt}`,
@@ -322,26 +488,26 @@ export default {
       const parts = text.split(/\s+/);
       const id = parts[1];
       if (!id) {
-        await tg(env, "sendMessage", { chat_id, text: "Gunakan: /cancel <INVOICE_ID>\nContoh: /cancel INVXXXX" });
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Gunakan: /cancel <INVOICE_ID>\nContoh: /cancel INVXXXX" });
         return new Response("OK");
       }
       const order = ORDERS.get(id);
       if (!order) {
-        await tg(env, "sendMessage", { chat_id, text: `Order dengan ID ${id} tidak ditemukan.` });
+        await tg(env, "sendMessage", { chat_id: chatId, text: `Order dengan ID ${id} tidak ditemukan.` });
         return new Response("OK");
       }
       const adminUserId = env.ADMIN_USER_ID ? Number(env.ADMIN_USER_ID) : null;
       if (order.userId !== fromId && adminUserId !== fromId) {
-        await tg(env, "sendMessage", { chat_id, text: `Anda tidak punya izin membatalkan order ini.` });
+        await tg(env, "sendMessage", { chat_id: chatId, text: `Anda tidak punya izin membatalkan order ini.` });
         return new Response("OK");
       }
       if (order.status === "cancelled") {
-        await tg(env, "sendMessage", { chat_id, text: `Order ${id} sudah dibatalkan sebelumnya.` });
+        await tg(env, "sendMessage", { chat_id: chatId, text: `Order ${id} sudah dibatalkan sebelumnya.` });
         return new Response("OK");
       }
       order.status = "cancelled";
       ORDERS.set(id, order);
-      await tg(env, "sendMessage", { chat_id, text: `Order ${id} berhasil dibatalkan.` });
+      await tg(env, "sendMessage", { chat_id: chatId, text: `Order ${id} berhasil dibatalkan.` });
       // notify admin optionally
       if (env.ADMIN_CHAT_ID) {
         await tg(env, "sendMessage", { chat_id: env.ADMIN_CHAT_ID, text: `Order ${id} dibatalkan oleh ${fromId}.` }).catch(()=>{});
@@ -357,7 +523,12 @@ export default {
       const p = PRODUCTS[productKey];
       if (!p) {
         USER_STATE.delete(fromId);
-        await tg(env, "sendMessage", { chat_id, text: "Produk tidak ditemukan. Silakan mulai ulang." });
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Produk tidak ditemukan. Silakan mulai ulang." });
+        return new Response("OK");
+      }
+
+      if ((p.stock ?? 0) < qty) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: `Maaf, stok ${p.name} tidak cukup. Stok saat ini: ${p.stock ?? 0}.` });
         return new Response("OK");
       }
 
@@ -367,7 +538,7 @@ export default {
 
       // show confirmation
       await tg(env, "sendMessage", {
-        chat_id,
+        chat_id: chatId,
         text:
           `🔍 *Konfirmasi Pesanan*\n\n` +
           `Produk: *${p.name}*\n` +
@@ -394,7 +565,7 @@ export default {
     if (lower.includes("roti") || lower.includes("menu") || lower.includes("ada")) {
       const buttons = Object.values(PRODUCTS).map(p => [{ text: p.name, callback_data: `menu_${p.key}` }]);
       await tg(env, "sendPhoto", {
-        chat_id,
+        chat_id: chatId,
         photo: MENU_IMAGE,
         caption: "🍞 *Menu Roti Hari Ini*\nSilakan pilih roti di bawah 👇",
         parse_mode: "Markdown",
@@ -405,8 +576,8 @@ export default {
 
     // Default fallback (human)
     await tg(env, "sendMessage", {
-      chat_id,
-      text: "Terima kasih kak 🙏\nPesan ini akan dibantu admin secara manual. Untuk memeriksa pesanan: /status <ID> atau batalkan /cancel <ID>."
+      chat_id: chatId,
+      text: "Terima kasih kak 🙏\nPesan ini akan dibantu admin secara manual. Untuk memeriksa pesanan: /status <ID> atau batalkan /cancel <ID>.\nAdmin commands: /addproduct, /addstock, /editstock, /editprice, /delproduct, /products"
     });
 
     return new Response("OK");
