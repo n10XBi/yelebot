@@ -1,22 +1,6 @@
 // worker-updated.js — Telegram Worker (with admin product management) // Env required: BOT_TOKEN, ADMIN_CHAT_ID (chat id where admin will get notifications) // Optional: ADMIN_USER_ID (telegram numeric id for admin user, used for permission checking)
 
 let USER_STATE = new Map(); // temporary per-user flow let ORDERS = new Map(); // invoiceId -> order object (in-memory)
-
-// CONFIG const MENU_IMAGE = "https://lh3.googleusercontent.com/86arOE_jc_FYR6_mPbeXrzWB4LwvgCRWPGXbbftgG4_zAjY05ajbmq3xiG0Xc_uYCoTccikGvLdo5WIlofH5pmySn1VRejqngh2pwDLquiLJYayCOJKUrZKFnOwmSxKzQqqOM1y5o42TPk6LYR1vbPjrEPx3JdPZT32TkqCECm-PoQtsBAPnyN6g46PbiyD9fblgzuBcT2xuO1AaZgOkR53bom8ATCBkDgcYT_mnsxWuxLGp6cNFUR4lWBFKyYkYJWJY--KmIVCWDDoJ3SxwjimGjwRG-X2Qu3AP4wa6tRazHuBo3a8IOofm6f5arSRdpVy4AaXoacTPz8TSkcofA0YaIttHpek1Gi5v1yMSbi5mHV6Mfv4lyczXPp8c5iNR7IFPvgMz1BiCETTxNwSvDjb2JCN94_256Fzejrs-Dk-kMYeCCYQh2Zd_lt9xiEQDgZ5gufdpxxM9xDiP447vrOqKbBMcAS_6hu43EwRi97ILAhBpS3QLP-4WhKf4GHauWqML_EcBvhszB-6T1iGeCWvpAT9jZVDVgekalBvLZiZNoy5Ow9QlnHA=w1827-h711-no";
-
-// Mutable product store (in-memory) let PRODUCTS = { premium: { key: "premium", name: "Roti Premium", desc: "Roti premium tanpa kulit dengan topping coklat & keju", price: 12000, image: MENU_IMAGE, stock: 10 } };
-
-// Working hours (WIB) const WORK_START = 8; // 08:00 const WORK_END = 17;  // 17:00 const TZ_OFFSET = 7;  // WIB = UTC+7
-
-// UTIL function getWIBDate() { const now = new Date(); const utc = now.getTime() + now.getTimezoneOffset() * 60000; return new Date(utc + TZ_OFFSET * 3600000); } function isWorkingHour() { const d = getWIBDate(); const h = d.getHours(); return h >= WORK_START && h < WORK_END; } function formatRupiah(num) { return "Rp" + Number(num).toLocaleString("id-ID"); } function generateInvoiceId() { return "INV" + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2,6).toUpperCase(); } function isAdmin(userId, env) { const adminUserId = env.ADMIN_USER_ID ? Number(env.ADMIN_USER_ID) : null; return adminUserId && Number(userId) === adminUserId; }
-
-// Telegram helper async function tg(env, method, data) { try { const res = await fetch(https://api.telegram.org/bot${env.BOT_TOKEN}/${method}, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) }); return res; } catch (e) { // swallow; caller can ignore or handle return null; } }
-
-// send admin notification (with approve/reject) async function notifyAdmin(env, order) { const adminChat = env.ADMIN_CHAT_ID; if (!adminChat) return; const text = 🔔 *New Order* (ID: ${order.id})\n\n + User: ${order.userId}\n + Produk: *${order.name}*\n + Jumlah: ${order.qty}\n + Total: *${formatRupiah(order.total)}*\n + Dibuat: ${order.createdAt}\n\n + Tekan Approve untuk setujui, Reject untuk tolak.; await tg(env, "sendMessage", { chat_id: adminChat, text, parse_mode: "Markdown", reply_markup: { inline_keyboard: [ [ { text: "✅ Approve", callback_data: admin_approve|${order.id} }, { text: "❌ Reject", callback_data: admin_reject|${order.id} } ], [ { text: "🗑 Cancel Order", callback_data: admin_cancel|${order.id} } ] ] } }); }
-
-// MAIN export default { async fetch(req, env) { if (req.method !== "POST") return new Response("OK"); let update; try { update = await req.json(); } catch (e) { return new Response("Bad Request", { status: 400 }); }
-
-// CALLBACK handler
 if (update.callback_query) {
   const cb = update.callback_query;
   const chatId = cb.message.chat.id;
