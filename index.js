@@ -1,5 +1,5 @@
-// worker-updated.js — Telegram Worker (with admin product management)
-// Env required: BOT_TOKEN, ADMIN_CHAT_ID (chat id where admin will get notifications)
+// worker-updated.js — Telegram Worker (with AI intent detection)
+// Env required: BOT_TOKEN, ADMIN_CHAT_ID, GROQ_API_KEY
 // Chat ID 7872093153 adalah admin
 
 let USER_STATE = new Map(); // temporary per-user flow
@@ -61,8 +61,114 @@ async function tg(env, method, data) {
     });
     return res;
   } catch (e) {
-    // swallow; caller can ignore or handle
     return null;
+  }
+}
+
+// AI Intent Detection using Groq
+async function aiParseIntent(env, text) {
+  // Default response
+  const defaultResponse = {
+    intent: "unknown",
+    product_key: null,
+    qty: null
+  };
+  
+  // Check if API key exists
+  if (!env.GROQ_API_KEY) {
+    console.log("GROQ_API_KEY not set, skipping AI detection");
+    return defaultResponse;
+  }
+  
+  // Product mapping for AI reference
+  const productList = Object.values(PRODUCTS).map(p => ({
+    key: p.key,
+    name: p.name,
+    aliases: [p.name.toLowerCase(), p.key]
+  }));
+  
+  const prompt = `Kamu adalah AI yang membantu memahami pesan pelanggan roti.
+Analisis pesan ini: "${text}"
+
+PRODUK YANG TERSEDIA:
+${productList.map(p => `- ${p.name} (key: ${p.key})`).join('\n')}
+
+TUGAS:
+1. Tentukan intent: "menu" (minta menu), "order" (pesan roti), "status" (cek status), "cancel" (batalkan), "unknown" (tidak tahu)
+2. Jika intent "order", identifikasi:
+   - product_key (gunakan key dari produk yang tersedia, contoh: "premium")
+   - qty (jumlah yang ingin dipesan, angka saja)
+
+ATURAN:
+- Jika user sebut "menu", "lihat roti", "ada apa" → intent: "menu"
+- Jika user sebut "pesan", "beli", "mau" + nama produk → intent: "order"
+- Jika user sebut "status", "cek pesanan" → intent: "status"
+- Jika user sebut "batal", "cancel" → intent: "cancel"
+- Jika ada angka dalam pesan, anggap sebagai qty
+- Jika produk tidak jelas, product_key: null
+- Jika tidak ada angka, qty: null
+
+HASILKAN JSON SAJA dengan format:
+{
+  "intent": "menu|order|status|cancel|unknown",
+  "product_key": "string|null",
+  "qty": number|null
+}`;
+
+  try {
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.GROQ_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "llama-3-8b-8192",
+        messages: [
+          {
+            role: "system",
+            content: "Kamu hanya output JSON valid, tanpa teks lain."
+          },
+          {
+            role: "user",
+            content: prompt
+          }
+        ],
+        temperature: 0,
+        max_tokens: 150
+      })
+    });
+    
+    if (!response.ok) {
+      console.error("Groq API error:", await response.text());
+      return defaultResponse;
+    }
+    
+    const data = await response.json();
+    const content = data.choices[0].message.content;
+    
+    // Extract JSON from response
+    const jsonMatch = content.match(/\{.*\}/s);
+    if (!jsonMatch) {
+      console.error("No JSON found in AI response:", content);
+      return defaultResponse;
+    }
+    
+    const parsed = JSON.parse(jsonMatch[0]);
+    
+    // Validate and normalize response
+    const validIntents = ["menu", "order", "status", "cancel", "unknown"];
+    const result = {
+      intent: validIntents.includes(parsed.intent) ? parsed.intent : "unknown",
+      product_key: parsed.product_key && productList.some(p => p.key === parsed.product_key) ? parsed.product_key : null,
+      qty: parsed.qty && Number.isInteger(parsed.qty) && parsed.qty > 0 ? parsed.qty : null
+    };
+    
+    console.log("AI parsed:", text, "->", result);
+    return result;
+  } catch (error) {
+    console.error("AI parsing error:", error);
+    return defaultResponse;
   }
 }
 
@@ -113,7 +219,6 @@ export default {
       const fromId = cb.from.id;
       const data = cb.data || "";
 
-      // Always answer to avoid "dead" buttons
       await tg(env, "answerCallbackQuery", { callback_query_id: cb.id }).catch(()=>{});
 
       // MENU selection (user)
@@ -158,9 +263,7 @@ export default {
 
       // confirm_order encoded: confirm_order|product|qty|userId
       if (data.startsWith("confirm_order|")) {
-        // parse tokens
         const tokens = data.split("|");
-        // expected [confirm_order, productKey, qty, userId]
         const productKey = tokens[1];
         const qty = Number(tokens[2]);
         const origUserId = Number(tokens[3]);
@@ -171,7 +274,6 @@ export default {
           return new Response("OK");
         }
 
-        // check stock
         if ((p.stock ?? 0) < qty) {
           await tg(env, "sendMessage", { 
             chat_id: chatId, 
@@ -181,14 +283,13 @@ export default {
           return new Response("OK");
         }
 
-        // create order
         const invId = generateInvoiceId();
         const now = getWIBDate().toISOString();
         const total = p.price * qty;
         const order = {
           id: invId,
           userId: origUserId,
-          chatId: chatId, // chat where confirmed (user chat)
+          chatId: chatId,
           product: p.key,
           name: p.name,
           desc: p.desc,
@@ -200,7 +301,6 @@ export default {
         };
         ORDERS.set(invId, order);
 
-        // notify user invoice created
         if (isWorkingHour()) {
           await tg(env, "sendMessage", {
             chat_id: chatId,
@@ -211,7 +311,6 @@ export default {
             parse_mode: "Markdown"
           });
         } else {
-          // compute next work start
           const nowDate = getWIBDate();
           let confirmAt = new Date(nowDate);
           if (nowDate.getHours() >= WORK_END) confirmAt.setDate(confirmAt.getDate() + 1);
@@ -227,12 +326,8 @@ export default {
           });
         }
 
-        // notify admin (with approve/reject)
         await notifyAdmin(env, order).catch(()=>{});
-
-        // clear any user state (we already stored order)
         USER_STATE.delete(origUserId);
-
         return new Response("OK");
       }
 
@@ -252,14 +347,12 @@ export default {
           return new Response("OK");
         }
 
-        // Hanya chat ID 7872093153 yang bisa approve/reject/cancel
         if (!isAdminChat(chatId)) {
           await tg(env, "sendMessage", { chat_id: chatId, text: "Anda tidak punya izin untuk melakukan aksi ini." });
           return new Response("OK");
         }
 
         if (cmd === "admin_approve") {
-          // reduce stock when approving
           const prod = PRODUCTS[order.product];
           if (!prod) {
             await tg(env, "sendMessage", { chat_id: chatId, text: `Produk untuk order ${invId} tidak ditemukan.` });
@@ -281,7 +374,6 @@ export default {
           order.status = "approved";
           ORDERS.set(invId, order);
 
-          // notify user
           await tg(env, "sendMessage", {
             chat_id: order.chatId,
             text: `✅ Pesanan Anda (ID: ${invId}) telah *DISETUJUI* oleh admin.\nAdmin akan menghubungi untuk konfirmasi selanjutnya.\nSisa stok ${prod.name}: *${prod.stock}*`,
@@ -317,7 +409,7 @@ export default {
       }
 
       return new Response("OK");
-    } // end callback_query
+    }
 
     // MESSAGE handler
     const msg = update.message;
@@ -326,7 +418,7 @@ export default {
     const fromId = msg.from.id;
     const text = msg.text.trim();
 
-    // Admin-only helpers via text commands - HANYA chat ID 7872093153
+    // Admin-only commands (no AI detection for admin commands)
     // /addproduct key|name|desc|price|stock|image(optional)
     if (text.startsWith("/addproduct")) {
       if (!isAdminChat(chatId)) {
@@ -347,7 +439,7 @@ export default {
       return new Response("OK");
     }
 
-    // /addstock key qty  -> menambah stok
+    // /addstock key qty
     if (text.startsWith("/addstock")) {
       if (!isAdminChat(chatId)) {
         await tg(env, "sendMessage", { chat_id: chatId, text: "Hanya admin yang dapat mengubah stok." });
@@ -370,7 +462,7 @@ export default {
       return new Response("OK");
     }
 
-    // /editstock key qty -> set stok
+    // /editstock key qty
     if (text.startsWith("/editstock")) {
       if (!isAdminChat(chatId)) {
         await tg(env, "sendMessage", { chat_id: chatId, text: "Hanya admin yang dapat mengubah stok." });
@@ -438,7 +530,8 @@ export default {
       return new Response("OK");
     }
 
-    // /products -> daftar produk beserta stok (bisa dilihat semua user)
+    // User commands (non-admin)
+    // /products -> daftar produk beserta stok
     if (text.startsWith("/products")) {
       const list = Object.values(PRODUCTS);
       if (!list.length) {
@@ -466,7 +559,6 @@ export default {
         await tg(env, "sendMessage", { chat_id: chatId, text: `Order dengan ID ${id} tidak ditemukan.` });
         return new Response("OK");
       }
-      // only owner or admin (chat ID 7872093153) can view details
       if (order.userId !== fromId && !isAdminChat(chatId)) {
         await tg(env, "sendMessage", { chat_id: chatId, text: `Anda tidak punya izin melihat order ini.` });
         return new Response("OK");
@@ -494,7 +586,6 @@ export default {
         await tg(env, "sendMessage", { chat_id: chatId, text: `Order dengan ID ${id} tidak ditemukan.` });
         return new Response("OK");
       }
-      // hanya owner atau admin (chat ID 7872093153) yang bisa membatalkan
       if (order.userId !== fromId && !isAdminChat(chatId)) {
         await tg(env, "sendMessage", { chat_id: chatId, text: `Anda tidak punya izin membatalkan order ini.` });
         return new Response("OK");
@@ -506,7 +597,6 @@ export default {
       order.status = "cancelled";
       ORDERS.set(id, order);
       await tg(env, "sendMessage", { chat_id: chatId, text: `Order ${id} berhasil dibatalkan.` });
-      // notify admin optionally
       if (env.ADMIN_CHAT_ID) {
         await tg(env, "sendMessage", { chat_id: env.ADMIN_CHAT_ID, text: `Order ${id} dibatalkan oleh ${fromId}.` }).catch(()=>{});
       }
@@ -530,11 +620,7 @@ export default {
         return new Response("OK");
       }
 
-      // Create confirmation buttons that encode all needed data in callback_data
-      // Format: confirm_order|productKey|qty|userId
       const callbackData = `confirm_order|${productKey}|${qty}|${fromId}`;
-
-      // show confirmation
       await tg(env, "sendMessage", {
         chat_id: chatId,
         text:
@@ -553,13 +639,109 @@ export default {
         }
       });
 
-      // keep small state if you want; not required for final confirmation
       USER_STATE.set(fromId, { step: "confirm_qty", product: productKey, qty });
       return new Response("OK");
     }
 
-    // General inquiry: show menu (image + buttons)
+    // AI INTENT DETECTION (Fallback for natural language)
+    // Only if not a command and not in flow
     const lower = text.toLowerCase();
+    const isManualMatch = lower.includes("roti") || lower.includes("menu") || lower.includes("ada");
+    
+    if (!text.startsWith("/") && !state?.step && !isManualMatch) {
+      // Use AI to detect intent
+      const aiResult = await aiParseIntent(env, text);
+      
+      // Handle based on AI intent
+      if (aiResult.intent === "menu") {
+        const buttons = Object.values(PRODUCTS).map(p => [{ text: p.name, callback_data: `menu_${p.key}` }]);
+        await tg(env, "sendPhoto", {
+          chat_id: chatId,
+          photo: MENU_IMAGE,
+          caption: "🍞 *Menu Roti Hari Ini*\nSilakan pilih roti di bawah 👇",
+          parse_mode: "Markdown",
+          reply_markup: { inline_keyboard: buttons }
+        });
+        return new Response("OK");
+      }
+      
+      else if (aiResult.intent === "order" && aiResult.product_key) {
+        const p = PRODUCTS[aiResult.product_key];
+        if (!p) {
+          // Product not found, show menu
+          const buttons = Object.values(PRODUCTS).map(p => [{ text: p.name, callback_data: `menu_${p.key}` }]);
+          await tg(env, "sendPhoto", {
+            chat_id: chatId,
+            photo: MENU_IMAGE,
+            caption: "🍞 *Menu Roti Hari Ini*\nSaya tidak yakin roti mana yang Anda maksud. Silakan pilih:",
+            parse_mode: "Markdown",
+            reply_markup: { inline_keyboard: buttons }
+          });
+          return new Response("OK");
+        }
+        
+        // If qty is detected by AI, proceed to confirmation
+        if (aiResult.qty) {
+          if ((p.stock ?? 0) < aiResult.qty) {
+            await tg(env, "sendMessage", { 
+              chat_id: chatId, 
+              text: `Maaf, stok ${p.name} tidak cukup. Stok saat ini: ${p.stock ?? 0}.` 
+            });
+            return new Response("OK");
+          }
+          
+          const callbackData = `confirm_order|${aiResult.product_key}|${aiResult.qty}|${fromId}`;
+          await tg(env, "sendMessage", {
+            chat_id: chatId,
+            text:
+              `🔍 *Konfirmasi Pesanan*\n\n` +
+              `Produk: *${p.name}*\n` +
+              `Jumlah: ${aiResult.qty}\n` +
+              `Harga satuan: ${formatRupiah(p.price)}\n\n` +
+              `*Total: ${formatRupiah(aiResult.qty * p.price)}*\n\n` +
+              `Apakah data pesanan ini sudah benar?`,
+            parse_mode: "Markdown",
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: "✅ Ya, Konfirmasi", callback_data: callbackData }],
+                [{ text: "❌ Batal", callback_data: "cancel_order" }]
+              ]
+            }
+          });
+          return new Response("OK");
+        } else {
+          // No qty detected, ask for quantity
+          USER_STATE.set(fromId, { step: "qty", product: aiResult.product_key });
+          await tg(env, "sendMessage", { 
+            chat_id: chatId, 
+            text: `Anda ingin memesan *${p.name}*. Mau pesan berapa buah?`,
+            parse_mode: "Markdown"
+          });
+          return new Response("OK");
+        }
+      }
+      
+      else if (aiResult.intent === "status") {
+        await tg(env, "sendMessage", { 
+          chat_id: chatId, 
+          text: "Untuk mengecek status pesanan, gunakan: /status <INVOICE_ID>\nContoh: /status INV1234ABCD" 
+        });
+        return new Response("OK");
+      }
+      
+      else if (aiResult.intent === "cancel") {
+        await tg(env, "sendMessage", { 
+          chat_id: chatId, 
+          text: "Untuk membatalkan pesanan, gunakan: /cancel <INVOICE_ID>\nContoh: /cancel INV1234ABCD" 
+        });
+        return new Response("OK");
+      }
+      
+      // If AI returns unknown or no valid intent detected
+      // Continue to manual matching
+    }
+
+    // Manual matching (original behavior - kept as fallback)
     if (lower.includes("roti") || lower.includes("menu") || lower.includes("ada")) {
       const buttons = Object.values(PRODUCTS).map(p => [{ text: p.name, callback_data: `menu_${p.key}` }]);
       await tg(env, "sendPhoto", {
@@ -572,7 +754,7 @@ export default {
       return new Response("OK");
     }
 
-    // Default fallback (human)
+    // Default fallback
     await tg(env, "sendMessage", {
       chat_id: chatId,
       text: "Terima kasih kak 🙏\nPesan ini akan dibantu admin secara manual. Untuk memeriksa pesanan: /status <ID> atau batalkan /cancel <ID>.\nUntuk melihat menu, ketik 'menu' atau 'roti'."
