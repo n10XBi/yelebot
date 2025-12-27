@@ -1,6 +1,6 @@
 // worker-updated.js — Telegram Worker (with admin product management)
 // Env required: BOT_TOKEN, ADMIN_CHAT_ID (chat id where admin will get notifications)
-// Optional: ADMIN_USER_ID (telegram numeric id for admin user, used for permission checking)
+// Chat ID 7872093153 adalah admin
 
 let USER_STATE = new Map(); // temporary per-user flow
 let ORDERS = new Map(); // invoiceId -> order object (in-memory)
@@ -46,9 +46,9 @@ function generateInvoiceId() {
   return "INV" + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2,6).toUpperCase();
 }
 
-function isAdmin(userId, env) {
-  const adminUserId = env.ADMIN_USER_ID ? Number(env.ADMIN_USER_ID) : null;
-  return adminUserId && Number(userId) === adminUserId;
+// Admin hanya berdasarkan chat ID
+function isAdminChat(chatId) {
+  return Number(chatId) === 7872093153;
 }
 
 // Telegram helper
@@ -252,9 +252,8 @@ export default {
           return new Response("OK");
         }
 
-        // Only allow admin (simple check). Admin user id can be provided via ADMIN_USER_ID env (optional).
-        const adminUserId = env.ADMIN_USER_ID ? Number(env.ADMIN_USER_ID) : null;
-        if (adminUserId && Number(fromId) !== adminUserId) {
+        // Hanya chat ID 7872093153 yang bisa approve/reject/cancel
+        if (!isAdminChat(chatId)) {
           await tg(env, "sendMessage", { chat_id: chatId, text: "Anda tidak punya izin untuk melakukan aksi ini." });
           return new Response("OK");
         }
@@ -327,10 +326,10 @@ export default {
     const fromId = msg.from.id;
     const text = msg.text.trim();
 
-    // Admin-only helpers via text commands
+    // Admin-only helpers via text commands - HANYA chat ID 7872093153
     // /addproduct key|name|desc|price|stock|image(optional)
     if (text.startsWith("/addproduct")) {
-      if (!isAdmin(fromId, env)) {
+      if (!isAdminChat(chatId)) {
         await tg(env, "sendMessage", { chat_id: chatId, text: "Hanya admin yang dapat menambah produk." });
         return new Response("OK");
       }
@@ -350,7 +349,7 @@ export default {
 
     // /addstock key qty  -> menambah stok
     if (text.startsWith("/addstock")) {
-      if (!isAdmin(fromId, env)) {
+      if (!isAdminChat(chatId)) {
         await tg(env, "sendMessage", { chat_id: chatId, text: "Hanya admin yang dapat mengubah stok." });
         return new Response("OK");
       }
@@ -373,7 +372,7 @@ export default {
 
     // /editstock key qty -> set stok
     if (text.startsWith("/editstock")) {
-      if (!isAdmin(fromId, env)) {
+      if (!isAdminChat(chatId)) {
         await tg(env, "sendMessage", { chat_id: chatId, text: "Hanya admin yang dapat mengubah stok." });
         return new Response("OK");
       }
@@ -396,7 +395,7 @@ export default {
 
     // /editprice key newPrice
     if (text.startsWith("/editprice")) {
-      if (!isAdmin(fromId, env)) {
+      if (!isAdminChat(chatId)) {
         await tg(env, "sendMessage", { chat_id: chatId, text: "Hanya admin yang dapat mengubah harga." });
         return new Response("OK");
       }
@@ -419,7 +418,7 @@ export default {
 
     // /delproduct key
     if (text.startsWith("/delproduct")) {
-      if (!isAdmin(fromId, env)) {
+      if (!isAdminChat(chatId)) {
         await tg(env, "sendMessage", { chat_id: chatId, text: "Hanya admin yang dapat menghapus produk." });
         return new Response("OK");
       }
@@ -439,7 +438,7 @@ export default {
       return new Response("OK");
     }
 
-    // /products -> daftar produk beserta stok
+    // /products -> daftar produk beserta stok (bisa dilihat semua user)
     if (text.startsWith("/products")) {
       const list = Object.values(PRODUCTS);
       if (!list.length) {
@@ -467,9 +466,8 @@ export default {
         await tg(env, "sendMessage", { chat_id: chatId, text: `Order dengan ID ${id} tidak ditemukan.` });
         return new Response("OK");
       }
-      // only owner or admin (ADMIN_USER_ID) can view details
-      const adminUserId = env.ADMIN_USER_ID ? Number(env.ADMIN_USER_ID) : null;
-      if (order.userId !== fromId && adminUserId !== fromId) {
+      // only owner or admin (chat ID 7872093153) can view details
+      if (order.userId !== fromId && !isAdminChat(chatId)) {
         await tg(env, "sendMessage", { chat_id: chatId, text: `Anda tidak punya izin melihat order ini.` });
         return new Response("OK");
       }
@@ -496,8 +494,8 @@ export default {
         await tg(env, "sendMessage", { chat_id: chatId, text: `Order dengan ID ${id} tidak ditemukan.` });
         return new Response("OK");
       }
-      const adminUserId = env.ADMIN_USER_ID ? Number(env.ADMIN_USER_ID) : null;
-      if (order.userId !== fromId && adminUserId !== fromId) {
+      // hanya owner atau admin (chat ID 7872093153) yang bisa membatalkan
+      if (order.userId !== fromId && !isAdminChat(chatId)) {
         await tg(env, "sendMessage", { chat_id: chatId, text: `Anda tidak punya izin membatalkan order ini.` });
         return new Response("OK");
       }
@@ -577,7 +575,7 @@ export default {
     // Default fallback (human)
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: "Terima kasih kak 🙏\nPesan ini akan dibantu admin secara manual. Untuk memeriksa pesanan: /status <ID> atau batalkan /cancel <ID>.\nAdmin commands: /addproduct, /addstock, /editstock, /editprice, /delproduct, /products"
+      text: "Terima kasih kak 🙏\nPesan ini akan dibantu admin secara manual. Untuk memeriksa pesanan: /status <ID> atau batalkan /cancel <ID>.\nUntuk melihat menu, ketik 'menu' atau 'roti'."
     });
 
     return new Response("OK");
